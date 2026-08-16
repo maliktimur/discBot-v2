@@ -35,11 +35,104 @@ repeat_mode = False  # Переменная для отслеживания ре
 current_track = None
 disconnect_task = None
 track_ending = False
+manual_stop = False
 
 vpn_fail_count = 0
 VPN_FAIL_LIMIT = 3
 last_vpn_state = None
 
+class SearchView(discord.ui.View):
+    def __init__(self, interaction, results, timeout=30):
+        super().__init__(timeout=timeout)
+
+        self.interaction = interaction
+        self.results = results
+
+        for i, track in enumerate(results[:3]):
+            button = discord.ui.Button(
+                label=str(i + 1),
+                style=discord.ButtonStyle.primary
+            )
+
+            button.callback = self.create_callback(i)
+            self.add_item(button)
+
+        cancel_button = discord.ui.Button(
+            label="❌",
+            style=discord.ButtonStyle.danger
+        )
+
+        cancel_button.callback = self.cancel_callback
+        self.add_item(cancel_button)
+
+    def create_callback(self, index):
+        async def callback(interaction: discord.Interaction):
+            # Только тот, кто запускал поиск, может выбрать трек
+            if interaction.user.id != self.interaction.user.id:
+                await interaction.response.send_message(
+                    "❌ Это не ваш поиск.",
+                    ephemeral=True
+                )
+                return
+
+            track_obj = self.results[index]
+
+            music_queue.append(track_obj)
+
+            logging.info(
+                f"🎵 Selected search result: {track_obj.title}"
+            )
+
+            logging.info(
+                f"Queue length: {len(music_queue)}"
+            )
+
+            # Отключаем кнопки
+            await interaction.response.edit_message(
+                content=(
+                    f"➕ Добавлено в очередь: "
+                    f"**{track_obj.title}**"
+                ),
+                embed=None,
+                view=None
+            )
+
+            player: wavelink.Player = interaction.guild.voice_client
+
+            if player and not player.playing and not player.paused:
+                await play_next(interaction.guild)
+
+            self.stop()
+
+        return callback
+
+    async def cancel_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.interaction.user.id:
+            await interaction.response.send_message(
+                "❌ Это не ваш поиск.",
+                ephemeral=True
+            )
+            return
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="❌ Поиск отменён.",
+            embed=None,
+            view=None
+        )
+
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            pass
 
 
 async def is_vpn_alive():
@@ -128,6 +221,7 @@ async def on_wavelink_track_end(
 ):
     global current_track
     global track_ending
+    global manual_stop
 
     player = payload.player
 
@@ -146,6 +240,15 @@ async def on_wavelink_track_end(
         logging.info(
             f"⏹️ TRACK END: {payload.track.title}"
         )
+
+        # /stop вызвал player.stop()
+        # Поэтому НЕ запускаем play_next()
+        if manual_stop:
+            logging.info(
+                "🛑 TRACK END caused by manual /stop - ignoring"
+            )
+            current_track = None
+            return
 
         if repeat_mode:
             await play_next(player.guild)
@@ -391,6 +494,65 @@ async def play_command(
 
     else:
 
+        # ==========================================
+        # ТЕКСТОВЫЙ ПОИСК
+        # ==========================================
+
+        # Для YouTube / SoundCloud показываем
+        # первые 3 результата пользователю
+        if source in ("YouTube", "SoundCloud"):
+
+            search_results = results[:3]
+
+            embed = discord.Embed(
+                title="🔎 Результаты поиска",
+                description=f'По запросу: **{query}**'
+            )
+
+            for i, track_obj in enumerate(search_results, start=1):
+
+                # Длительность
+                duration_ms = track_obj.length or 0
+                duration_seconds = duration_ms // 1000
+
+                minutes = duration_seconds // 60
+                seconds = duration_seconds % 60
+
+                duration = f"{minutes}:{seconds:02d}"
+
+                embed.add_field(
+                    name=f"{i}. {track_obj.title}",
+                    value=(
+                        f"👤 {track_obj.author}\n"
+                        f"⏱️ {duration}"
+                    ),
+                    inline=False
+                )
+
+            embed.set_footer(
+                text="Выберите трек кнопкой ниже • 30 секунд"
+            )
+
+            view = SearchView(
+                interaction,
+                search_results
+            )
+
+            message = await interaction.followup.send(
+                embed=embed,
+                view=view,
+                wait=True
+            )
+
+            # Нужно для корректного удаления/disable кнопок
+            view.message = message
+
+            return
+
+        # ==========================================
+        # URL
+        # ==========================================
+
         track_obj = results[0]
 
         music_queue.append(track_obj)
@@ -506,10 +668,27 @@ async def stop_command(interaction: discord.Interaction):
     global current_track
     global repeat_mode
     global disconnect_task
-
+    global manual_stop
 
     player: wavelink.Player = interaction.guild.voice_client
 
+    if player is None or not player.connected:
+        current_track = None
+        repeat_mode = False
+        music_queue.clear()
+
+        if disconnect_task and not disconnect_task.done():
+            disconnect_task.cancel()
+            disconnect_task = None
+
+        await interaction.response.send_message(
+            "⏹️ Бот уже не находится в голосовом канале."
+        )
+        return
+
+    # ВАЖНО:
+    # TRACK END после player.stop() не должен запускать play_next()
+    manual_stop = True
 
     repeat_mode = False
     current_track = None
@@ -522,16 +701,14 @@ async def stop_command(interaction: discord.Interaction):
         disconnect_task = None
         logging.info("🛑 Disconnect timer cancelled")
 
-    if player is None:
-        await interaction.response.send_message(
-            "Бот не находится в голосовом канале."
-        )
-        return
-
     if player.playing or player.paused:
         await player.stop()
 
+    # Отключаемся сами
     await player.disconnect()
+
+    # Сбрасываем флаг после disconnect
+    manual_stop = False
 
     await interaction.response.send_message(
         "⏹️ Воспроизведение остановлено и очередь очищена."
