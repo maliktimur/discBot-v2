@@ -34,7 +34,7 @@ music_queue = deque()
 repeat_mode = False  # Переменная для отслеживания режима повторения
 current_track = None
 disconnect_task = None
-manual_stop = False
+track_ending = False
 
 vpn_fail_count = 0
 VPN_FAIL_LIMIT = 3
@@ -126,23 +126,35 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
 async def on_wavelink_track_end(
     payload: wavelink.TrackEndEventPayload
 ):
-    global manual_stop
-
-    logging.info(f"⏹️ TRACK END: {payload.track.title}")
+    global current_track
+    global track_ending
 
     player = payload.player
 
     if player is None:
         return
 
-    if manual_stop:
-        logging.info("⏹️ Manual stop, not starting next track")
+    if track_ending:
+        logging.warning(
+            f"⚠️ Duplicate TRACK END ignored: {payload.track.title}"
+        )
         return
 
-    if not music_queue and not repeat_mode:
-        logging.info("Queue finished")
+    track_ending = True
 
-    await play_next(player.guild)
+    try:
+        logging.info(
+            f"⏹️ TRACK END: {payload.track.title}"
+        )
+
+        if repeat_mode:
+            await play_next(player.guild)
+        else:
+            current_track = None
+            await play_next(player.guild)
+
+    finally:
+        track_ending = False
 
 
 @bot.event
@@ -190,7 +202,7 @@ async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
-    if voice_client is None or not voice_client.is_connected():
+    if voice_client is None or not voice_client.connected:
         return
 
     channel = voice_client.channel
@@ -407,6 +419,7 @@ async def play_command(
 async def play_next(guild):
     global current_track
     global disconnect_task
+     
 
     player: wavelink.Player = guild.voice_client
 
@@ -436,6 +449,7 @@ async def play_next(guild):
 
     logging.info(f"▶️ Playing: {track.title}")
     logging.info(f"Queue remaining: {len(music_queue)}")
+
 
     try:
         await player.play(track)
@@ -492,11 +506,11 @@ async def stop_command(interaction: discord.Interaction):
     global current_track
     global repeat_mode
     global disconnect_task
-    global manual_stop
+
 
     player: wavelink.Player = interaction.guild.voice_client
 
-    manual_stop = True
+
     repeat_mode = False
     current_track = None
     music_queue.clear()
@@ -509,7 +523,6 @@ async def stop_command(interaction: discord.Interaction):
         logging.info("🛑 Disconnect timer cancelled")
 
     if player is None:
-        manual_stop = False
         await interaction.response.send_message(
             "Бот не находится в голосовом канале."
         )
@@ -519,8 +532,6 @@ async def stop_command(interaction: discord.Interaction):
         await player.stop()
 
     await player.disconnect()
-
-    manual_stop = False
 
     await interaction.response.send_message(
         "⏹️ Воспроизведение остановлено и очередь очищена."
