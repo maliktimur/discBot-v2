@@ -36,6 +36,7 @@ current_track = None
 disconnect_task = None
 track_ending = False
 manual_stop = False
+playback_text_channels = {}
 
 vpn_fail_count = 0
 VPN_FAIL_LIMIT = 3
@@ -260,17 +261,43 @@ async def on_wavelink_track_end(
         track_ending = False
 
 
+async def send_playback_error(player, track):
+    try:
+        channel_id = playback_text_channels.get(player.guild.id)
+
+        if channel_id is None:
+            return
+
+        channel = player.guild.get_channel(channel_id)
+
+        if channel is None:
+            return
+
+        await channel.send(
+            f"❌ Не удалось воспроизвести **{track.title}**.\n"
+            f"YouTube не предоставил поток для воспроизведения этого видео."
+        )
+
+    except Exception:
+        logging.exception("Failed to send playback error")
+
+
+
 @bot.event
 async def on_wavelink_track_exception(
     payload: wavelink.TrackExceptionEventPayload
 ):
+    track = payload.track
+    player = payload.player
+
     logging.error(
         f"❌ TRACK EXCEPTION: "
-        f"{payload.track.title}: {payload.exception}"
+        f"{track.title}: {payload.exception}"
     )
 
-    if payload.player is not None:
-        await play_next(payload.player.guild)
+    if player is not None:
+        await send_playback_error(player, track)
+        await play_next(player.guild)
 
 
 @bot.event
@@ -356,6 +383,8 @@ async def play_command(
     track: str,
 ):
     await interaction.response.defer(thinking=True)
+
+    playback_text_channels[interaction.guild.id] = interaction.channel.id
 
     global disconnect_task
 
