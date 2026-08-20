@@ -523,65 +523,8 @@ async def play_command(
 
     else:
 
-        # ==========================================
-        # ТЕКСТОВЫЙ ПОИСК
-        # ==========================================
-
-        # Для YouTube / SoundCloud показываем
-        # первые 3 результата пользователю
-        if source in ("YouTube", "SoundCloud"):
-
-            search_results = results[:3]
-
-            embed = discord.Embed(
-                title="🔎 Результаты поиска",
-                description=f'По запросу: **{query}**'
-            )
-
-            for i, track_obj in enumerate(search_results, start=1):
-
-                # Длительность
-                duration_ms = track_obj.length or 0
-                duration_seconds = duration_ms // 1000
-
-                minutes = duration_seconds // 60
-                seconds = duration_seconds % 60
-
-                duration = f"{minutes}:{seconds:02d}"
-
-                embed.add_field(
-                    name=f"{i}. {track_obj.title}",
-                    value=(
-                        f"👤 {track_obj.author}\n"
-                        f"⏱️ {duration}"
-                    ),
-                    inline=False
-                )
-
-            embed.set_footer(
-                text="Выберите трек кнопкой ниже • 30 секунд"
-            )
-
-            view = SearchView(
-                interaction,
-                search_results
-            )
-
-            message = await interaction.followup.send(
-                embed=embed,
-                view=view,
-                wait=True
-            )
-
-            # Нужно для корректного удаления/disable кнопок
-            view.message = message
-
-            return
-
-        # ==========================================
-        # URL
-        # ==========================================
-
+        # Для любого обычного результата
+        # сразу берём первый найденный трек
         track_obj = results[0]
 
         music_queue.append(track_obj)
@@ -604,7 +547,6 @@ async def play_command(
 
     if not player.playing and not player.paused:
         await play_next(interaction.guild)
-
 
 # Функция для воспроизведения музыки
 async def play_next(guild):
