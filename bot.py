@@ -428,6 +428,9 @@ async def play_command(
                 "❌ Вы выбрали источник **URL**, "
                 "но не ввели корректную ссылку."
             )
+            
+            await play_next(interaction.guild)
+            
             return
 
         query = track
@@ -444,6 +447,9 @@ async def play_command(
                 "Пожалуйста, выберите источник **URL**, "
                 "если хотите вставить ссылку."
             )
+
+            await play_next(interaction.guild)
+
             return
 
         query = track
@@ -474,12 +480,18 @@ async def play_command(
         await interaction.followup.send(
             f"❌ Ошибка поиска: `{e}`"
         )
+
+        await play_next(interaction.guild)
+                
         return
 
     if not results:
         await interaction.followup.send(
             "❌ Ничего не найдено."
         )
+
+        await play_next(interaction.guild)
+
         return
 
     # ==========================================
@@ -494,6 +506,9 @@ async def play_command(
             await interaction.followup.send(
                 "❌ Плейлист пуст или недоступен."
             )
+
+            await play_next(interaction.guild)
+
             return
 
         # Добавляем все треки плейлиста
