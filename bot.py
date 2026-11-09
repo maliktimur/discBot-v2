@@ -6,6 +6,7 @@ from discord.ext import commands
 from typing import Literal
 from discord import app_commands
 from collections import deque
+from dataclasses import dataclass, field
 from config import *
 from utils import is_url, ColorFormatter
 import wavelink
@@ -28,15 +29,46 @@ logger = logging.getLogger(__name__)
 # Настройка бота
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Очередь воспроизведения
-music_queue = deque()
-#ctx_queue = deque()
-repeat_mode = False  # Переменная для отслеживания режима повторения
-current_track = None
-disconnect_task = None
-track_ending = False
-manual_stop = False
-playback_text_channels = {}
+# Independent playback state for each Discord guild.
+@dataclass
+class GuildState:
+    queue: deque = field(default_factory=deque)
+    repeat_mode: bool = False
+    current_track: object = None
+    disconnect_task: asyncio.Task | None = None
+    track_ending: bool = False
+    manual_stop: bool = False
+    playback_text_channel: int | None = None
+    play_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Ignore stale track-end events after a manual skip/stop.
+    ignored_ends: set = field(default_factory=set)
+
+
+guild_states: dict[int, GuildState] = {}
+
+
+def get_guild_state(guild_id: int) -> GuildState:
+    return guild_states.setdefault(guild_id, GuildState())
+
+
+def guild_label(guild: discord.Guild) -> str:
+    """Readable guild name and ID for playback logs."""
+    return f"{guild.name} ({guild.id})"
+
+
+def cancel_disconnect_timer(state: GuildState):
+    task = state.disconnect_task
+    if task is not None and not task.done():
+        task.cancel()
+    state.disconnect_task = None
+
+
+def reset_guild_state(state: GuildState):
+    cancel_disconnect_timer(state)
+    state.queue.clear()
+    state.repeat_mode = False
+    state.current_track = None
+
 
 vpn_fail_count = 0
 VPN_FAIL_LIMIT = 3
@@ -77,15 +109,16 @@ class SearchView(discord.ui.View):
                 return
 
             track_obj = self.results[index]
+            state = get_guild_state(interaction.guild.id)
 
-            music_queue.append(track_obj)
+            state.queue.append(track_obj)
 
             logging.info(
-                f"🎵 Selected search result: {track_obj.title}"
+                f"🎵 [{guild_label(interaction.guild)}] Selected search result: {track_obj.title}"
             )
 
             logging.info(
-                f"Queue length: {len(music_queue)}"
+                f"[{guild_label(interaction.guild)}] Queue length: {len(state.queue)}"
             )
 
             # Отключаем кнопки
@@ -203,7 +236,8 @@ async def on_ready():
     except Exception as e:
         logging.error(f"Error syncing commands: {e}")
 
-    asyncio.create_task(vpn_iface_watchdog())
+    if not getattr(bot, "vpn_watchdog_task", None) or bot.vpn_watchdog_task.done():
+        bot.vpn_watchdog_task = asyncio.create_task(vpn_iface_watchdog())
 
 
 @bot.event
@@ -213,57 +247,41 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 
 @bot.event
 async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
-    logging.info(f"🎵 TRACK START: {payload.track.title}")
+    logging.info("🎵 TRACK START [%s]: %s", guild_label(payload.player.guild) if payload.player and payload.player.guild else "unknown guild", payload.track.title)
 
 
 @bot.event
-async def on_wavelink_track_end(
-    payload: wavelink.TrackEndEventPayload
-):
-    global current_track
-    global track_ending
-    global manual_stop
-
+async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = payload.player
-
-    if player is None:
+    if player is None or player.guild is None:
         return
-
-    if track_ending:
-        logging.warning(
-            f"⚠️ Duplicate TRACK END ignored: {payload.track.title}"
-        )
+    state = get_guild_state(player.guild.id)
+    track = payload.track
+    identifier = getattr(track, "identifier", None)
+    # Stop and skip generate an end event. Never let it advance twice.
+    if identifier is not None and identifier in state.ignored_ends:
+        state.ignored_ends.discard(identifier)
         return
-
-    track_ending = True
-
+    if state.manual_stop or state.track_ending:
+        return
+    # A delayed event from a previous track must not affect the current one.
+    current = state.current_track
+    if current is not None and track is not None and getattr(current, "identifier", None) != identifier:
+        logging.info("Ignoring stale track-end event in guild %s", guild_label(player.guild))
+        return
+    state.track_ending = True
     try:
-        logging.info(
-            f"⏹️ TRACK END: {payload.track.title}"
-        )
-
-        # /stop вызвал player.stop()
-        # Поэтому НЕ запускаем play_next()
-        if manual_stop:
-            logging.info(
-                "🛑 TRACK END caused by manual /stop - ignoring"
-            )
-            current_track = None
-            return
-
-        if repeat_mode:
-            await play_next(player.guild)
-        else:
-            current_track = None
-            await play_next(player.guild)
-
+        logging.info("⏹️ TRACK END [%s]: %s", guild_label(player.guild), track.title)
+        if not state.repeat_mode:
+            state.current_track = None
+        await play_next(player.guild)
     finally:
-        track_ending = False
+        state.track_ending = False
 
 
 async def send_playback_error(player, track):
     try:
-        channel_id = playback_text_channels.get(player.guild.id)
+        channel_id = get_guild_state(player.guild.id).playback_text_channel
 
         if channel_id is None:
             return
@@ -279,7 +297,7 @@ async def send_playback_error(player, track):
         )
 
     except Exception:
-        logging.exception("Failed to send playback error")
+        logging.exception("Failed to send playback error [%s]", guild_label(player.guild))
 
 
 
@@ -291,7 +309,7 @@ async def on_wavelink_track_exception(
     player = payload.player
 
     logging.error(
-        f"❌ TRACK EXCEPTION: "
+        f"❌ TRACK EXCEPTION [{guild_label(player.guild) if player and player.guild else 'unknown guild'}]: "
         f"{track.title}: {payload.exception}"
     )
 
@@ -305,7 +323,7 @@ async def on_wavelink_track_stuck(
     payload: wavelink.TrackStuckEventPayload
 ):
     logging.error(
-        f"⚠️ TRACK STUCK: "
+        f"⚠️ TRACK STUCK [{guild_label(payload.player.guild) if payload.player and payload.player.guild else 'unknown guild'}]: "
         f"{payload.track.title}, "
         f"threshold={payload.threshold}"
     )
@@ -316,40 +334,32 @@ async def on_wavelink_track_stuck(
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    voice_client = member.guild.voice_client
-    if member == bot.user:
-        # бот был в канале, но теперь нет
+    guild = member.guild
+    state = get_guild_state(guild.id)
+    if member.id == bot.user.id:
         if before.channel and after.channel is None:
-
-            vc = member.guild.voice_client
-
-            logging.warning("🚪 Bot left voice (state change detected)")
-
-            # 👉 если ты НЕ вызывал disconnect сам
-            if vc is None:
-                logging.warning("⚠️ VoiceClient already gone (external disconnect)")
-
+            logging.warning("🚪 Bot left voice in guild %s", guild_label(guild))
+            reset_guild_state(state)
+        return
     if member.bot:
         return
-
+    voice_client = guild.voice_client
     if voice_client is None or not voice_client.connected:
         return
-
     channel = voice_client.channel
-
+    if channel is None or (before.channel != channel and after.channel != channel):
+        return
     await asyncio.sleep(2)
-    # Проверяем, остался ли в голосовом канале только бот
-    if len([m for m in channel.members if not m.bot]) == 0:
-        global current_track
-        global repeat_mode
-        
-
-        current_track = None
-        repeat_mode = False
-        music_queue.clear()
-        logging.info(f'Длина очереди: {len(music_queue)}(очищена, все отключились)')
-        logging.info("Все пользователи покинули канал. Отключаюсь...")
-        await voice_client.disconnect()
+    if guild.voice_client is not voice_client or voice_client.channel != channel:
+        return
+    if not any(not m.bot for m in channel.members):
+        logging.info("Voice channel empty in guild %s; disconnecting", guild_label(guild))
+        state.manual_stop = True
+        reset_guild_state(state)
+        try:
+            await voice_client.disconnect()
+        finally:
+            state.manual_stop = False
 
 
 # Слэш-Функция для списка команд
@@ -384,14 +394,9 @@ async def play_command(
 ):
     await interaction.response.defer(thinking=True)
 
-    playback_text_channels[interaction.guild.id] = interaction.channel.id
-
-    global disconnect_task
-
-    if disconnect_task and not disconnect_task.done():
-        disconnect_task.cancel()
-        disconnect_task = None
-        logging.info("🛑 Disconnect timer cancelled")
+    state = get_guild_state(interaction.guild.id)
+    state.playback_text_channel = interaction.channel.id
+    cancel_disconnect_timer(state)
 
     if interaction.user.voice is None:
         await interaction.followup.send(
@@ -405,13 +410,13 @@ async def play_command(
 
     # Подключаемся
     if player is None:
-        logging.info(f"Connecting to {voice_channel.name}")
+        logging.info(f"[{guild_label(interaction.guild)}] Connecting to {voice_channel.name}")
 
         player = await voice_channel.connect(
             cls=wavelink.Player
         )
 
-        logging.info("Connected to voice")
+        logging.info("[%s] Connected to voice", guild_label(interaction.guild))
 
     elif player.channel != voice_channel:
         await player.move_to(voice_channel)
@@ -461,7 +466,7 @@ async def play_command(
             search_source = wavelink.TrackSource.SoundCloud
 
     logging.info(
-        f'Searching: "{query}" '
+        f'[{guild_label(interaction.guild)}] Searching: "{query}" '
         f'(source={search_source})'
     )
 
@@ -475,7 +480,7 @@ async def play_command(
             )
 
     except Exception as e:
-        logging.exception("Search error")
+        logging.exception("Search error [%s]", guild_label(interaction.guild))
 
         await interaction.followup.send(
             f"❌ Ошибка поиска: `{e}`"
@@ -513,18 +518,18 @@ async def play_command(
 
         # Добавляем все треки плейлиста
         for track_obj in tracks:
-            music_queue.append(track_obj)
+            state.queue.append(track_obj)
 
         logging.info(
-            f"📋 Playlist: {results.name}"
+            f"📋 [{guild_label(interaction.guild)}] Playlist: {results.name}"
         )
 
         logging.info(
-            f"📋 Added {len(tracks)} tracks"
+            f"📋 [{guild_label(interaction.guild)}] Added {len(tracks)} tracks"
         )
 
         logging.info(
-            f"Queue length: {len(music_queue)}"
+            f"[{guild_label(interaction.guild)}] Queue length: {len(state.queue)}"
         )
 
         await interaction.followup.send(
@@ -542,14 +547,14 @@ async def play_command(
         # сразу берём первый найденный трек
         track_obj = results[0]
 
-        music_queue.append(track_obj)
+        state.queue.append(track_obj)
 
         logging.info(
-            f"🎵 Added to queue: {track_obj.title}"
+            f"🎵 [{guild_label(interaction.guild)}] Added to queue: {track_obj.title}"
         )
 
         logging.info(
-            f"Queue length: {len(music_queue)}"
+            f"[{guild_label(interaction.guild)}] Queue length: {len(state.queue)}"
         )
 
         await interaction.followup.send(
@@ -563,86 +568,56 @@ async def play_command(
     if not player.playing and not player.paused:
         await play_next(interaction.guild)
 
-# Функция для воспроизведения музыки
+# Start next track, serialized per guild to avoid two simultaneous starts.
 async def play_next(guild):
-    global current_track
-    global disconnect_task
-     
-
-    player: wavelink.Player = guild.voice_client
-
-    if player is None or not player.connected:
-        logging.warning("❌ Player is not connected")
-        return
-
-    if player.playing or player.paused:
-        return
-
-    if repeat_mode and current_track is not None:
-        track = current_track
-    else:
-        if not music_queue:
-            logging.info("Queue is empty")
-
-            if disconnect_task is None or disconnect_task.done():
-                disconnect_task = asyncio.create_task(
-                    start_disconnect_timer(guild)
-                )
-
+    state = get_guild_state(guild.id)
+    async with state.play_lock:
+        player: wavelink.Player = guild.voice_client
+        if player is None or not player.connected or state.manual_stop:
             return
+        if player.playing or player.paused:
+            return
+        cancel_disconnect_timer(state)
+        while True:
+            if state.repeat_mode and state.current_track is not None:
+                track = state.current_track
+            elif state.queue:
+                track = state.queue.popleft()
+            else:
+                state.current_track = None
+                state.disconnect_task = asyncio.create_task(start_disconnect_timer(guild))
+                logging.info("Queue empty in guild %s", guild_label(guild))
+                return
+            state.current_track = track
+            try:
+                logging.info("▶️ Playing [%s]: %s (remaining %s)", guild_label(guild), track.title, len(state.queue))
+                await player.play(track)
+                return
+            except Exception:
+                logging.exception("Playback failed in guild %s", guild_label(guild))
+                state.current_track = None
+                # A broken track should not repeat forever.
+                state.repeat_mode = False
 
-        track = music_queue.popleft()
 
-    current_track = track
-
-    logging.info(f"▶️ Playing: {track.title}")
-    logging.info(f"Queue remaining: {len(music_queue)}")
-
-
-    try:
-        await player.play(track)
-
-    except Exception as e:
-        logging.exception(f"Playback error: {e}")
-
-        current_track = None
-
-        if music_queue:
-            await play_next(guild)
-
-
-
-# Функция для запуска таймера отключения
 async def start_disconnect_timer(guild):
-    global disconnect_task
-
-    logging.info("DISCONNECT TIME STARTED")
-
+    state = get_guild_state(guild.id)
     try:
         await asyncio.sleep(90)
-
-        voice_client: wavelink.Player = guild.voice_client
-
-        if (
-            voice_client
-            and not voice_client.playing
-            and not voice_client.paused
-            and not music_queue
-            and not repeat_mode
-        ):
-            await voice_client.disconnect()
-            logging.info(f"{bot.user.name} disconnected")
-
-        else:
-            logging.info(
-                "Still playing or queue not empty, disconnection aborted"
-            )
-
+        player: wavelink.Player = guild.voice_client
+        if (player and player.connected and not player.playing and not player.paused
+                and not state.queue and not state.repeat_mode):
+            state.manual_stop = True
+            try:
+                await player.disconnect()
+                logging.info("Disconnected after idle timeout [%s]", guild_label(guild))
+            finally:
+                state.manual_stop = False
     except asyncio.CancelledError:
-        logging.info("DISCONNECT TIMER CANCELLED")
-
+        pass
     finally:
-        disconnect_task = None
+        if state.disconnect_task is asyncio.current_task():
+            state.disconnect_task = None
 
 
 # Команда для остановки музыки и очистки очереди
@@ -651,54 +626,19 @@ async def start_disconnect_timer(guild):
     description="Остановить музыку и очистить очередь"
 )
 async def stop_command(interaction: discord.Interaction):
-    global current_track
-    global repeat_mode
-    global disconnect_task
-    global manual_stop
-
+    state = get_guild_state(interaction.guild.id)
     player: wavelink.Player = interaction.guild.voice_client
-
+    state.manual_stop = True
+    reset_guild_state(state)
     if player is None or not player.connected:
-        current_track = None
-        repeat_mode = False
-        music_queue.clear()
-
-        if disconnect_task and not disconnect_task.done():
-            disconnect_task.cancel()
-            disconnect_task = None
-
-        await interaction.response.send_message(
-            "⏹️ Бот уже не находится в голосовом канале."
-        )
+        state.manual_stop = False
+        await interaction.response.send_message("⏹️ Бот уже не находится в голосовом канале.")
         return
-
-    # ВАЖНО:
-    # TRACK END после player.stop() не должен запускать play_next()
-    manual_stop = True
-
-    repeat_mode = False
-    current_track = None
-    music_queue.clear()
-
-    logging.info("🗑️ Queue cleared")
-
-    if disconnect_task and not disconnect_task.done():
-        disconnect_task.cancel()
-        disconnect_task = None
-        logging.info("🛑 Disconnect timer cancelled")
-
-    if player.playing or player.paused:
-        await player.stop()
-
-    # Отключаемся сами
-    await player.disconnect()
-
-    # Сбрасываем флаг после disconnect
-    manual_stop = False
-
-    await interaction.response.send_message(
-        "⏹️ Воспроизведение остановлено и очередь очищена."
-    )
+    try:
+        await player.disconnect()
+    finally:
+        state.manual_stop = False
+    await interaction.response.send_message("⏹️ Воспроизведение остановлено и очередь очищена.")
 
 
 # Функция для паузы музыки
@@ -762,38 +702,24 @@ async def resume_command(interaction: discord.Interaction):
     description="Пропустить текущий трек"
 )
 async def skip_command(interaction: discord.Interaction):
-    global current_track
-    global repeat_mode
-
+    state = get_guild_state(interaction.guild.id)
     player: wavelink.Player = interaction.guild.voice_client
-
-    if player is None:
-        await interaction.response.send_message(
-            "Бот не находится в голосовом канале.",
-            ephemeral=True
-        )
+    if player is None or not player.connected:
+        await interaction.response.send_message("Бот не находится в голосовом канале.", ephemeral=True)
         return
-
-    if not player.playing:
-        await interaction.response.send_message(
-            "Сейчас ничего не воспроизводится."
-        )
+    if not player.playing and not player.paused:
+        await interaction.response.send_message("Сейчас ничего не воспроизводится.")
         return
-
-    if current_track is not None:
-        logging.info(
-            f"⏭️ Skipping: {current_track.title}"
-        )
-
-    # Skip должен действительно пропустить текущий трек
-    repeat_mode = False
-    current_track = None
-
-    await player.stop()
-
-    await interaction.response.send_message(
-        "⏭️ Трек пропущен."
-    )
+    old_track = state.current_track
+    state.repeat_mode = False
+    state.current_track = None
+    if old_track is not None:
+        identifier = getattr(old_track, "identifier", None)
+        if identifier is not None:
+            state.ignored_ends.add(identifier)
+    await interaction.response.send_message("⏭️ Трек пропущен.")
+    await player.skip(force=True)
+    await play_next(interaction.guild)
 
 
 # Команда для включения/выключения повторения
@@ -802,30 +728,16 @@ async def skip_command(interaction: discord.Interaction):
     description="Включить или выключить повторение"
 )
 async def repeat_command(interaction: discord.Interaction):
-    global repeat_mode
-
+    state = get_guild_state(interaction.guild.id)
     player: wavelink.Player = interaction.guild.voice_client
-
-    if player is None:
-        await interaction.response.send_message(
-            "Бот не находится в голосовом канале."
-        )
+    if player is None or not player.connected:
+        await interaction.response.send_message("Бот не находится в голосовом канале.")
         return
-
-    repeat_mode = not repeat_mode
-
-    if repeat_mode:
-        logging.info("🔁 Repeat mode: ON")
-
-        await interaction.response.send_message(
-            "🔁 Режим повторения включен."
-        )
+    state.repeat_mode = not state.repeat_mode
+    if state.repeat_mode:
+        await interaction.response.send_message("🔁 Режим повторения включен.")
     else:
-        logging.info("➡️ Repeat mode: OFF")
-
-        await interaction.response.send_message(
-            "➡️ Режим повторения выключен."
-        )
+        await interaction.response.send_message("➡️ Режим повторения выключен.")
 
 
 # Запуск бота
